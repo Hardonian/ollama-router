@@ -22,10 +22,13 @@ MODEL_SIZES = {
 }
 
 # GPU lane mappings by VRAM capacity
+# Ports MUST match the live systemd lane bindings
+# (ollama-v100.service=>11437, ollama-p40.service=>11435, ollama-3060.service=>11436).
+# Router targets 127.0.0.1:<port>; lanes are localhost-only (no LAN exposure).
 GPU_LANES = {
-    "v100": {"port": 11435, "vram_gb": 16, "compute": "7.0"},
-    "p40": {"port": 11436, "vram_gb": 24, "compute": "6.1"},
-    "3060": {"port": 11437, "vram_gb": 12, "compute": "8.6"},
+    "v100": {"port": 11437, "vram_gb": 16, "compute": "7.0"},
+    "p40": {"port": 11435, "vram_gb": 24, "compute": "6.1"},
+    "3060": {"port": 11436, "vram_gb": 12, "compute": "8.6"},
 }
 
 
