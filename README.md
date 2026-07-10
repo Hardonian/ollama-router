@@ -4,7 +4,6 @@ A local FastAPI proxy that routes Ollama model requests to the correct GPU lane
 based on model VRAM requirements. Sits in front of multiple `ollama serve`
 instances (one per GPU) and forwards requests transparently.
 
-<img src="/home/scott/ai-workspace/assets/repo-previews/ollama-router.png" alt="Ollama Router" width="800"/>
 
 ## Why
 
