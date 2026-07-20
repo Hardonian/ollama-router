@@ -1,4 +1,3 @@
-import json
 import httpx
 import re
 from fastapi import FastAPI, HTTPException, Request
@@ -72,7 +71,7 @@ async def proxy(request: Request, path: str):
         try:
             body = await request.json()
             model_name = body.get("model", "")
-        except:
+        except ValueError:
             pass
     
     target_port = route_model(model_name) if model_name else GPU_LANES["3060"]["port"]
@@ -93,7 +92,7 @@ async def proxy(request: Request, path: str):
             
             try:
                 content = resp.json()
-            except:
+            except ValueError:
                 content = resp.text
             
             return JSONResponse(

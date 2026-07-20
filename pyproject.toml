@@ -18,3 +18,11 @@ packages = ["app"]
 
 [tool.uv]
 package = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "C4", "UP", "SIM"]
+ignore = ["E402", "B008", "B904", "SIM105", "SIM108"]
