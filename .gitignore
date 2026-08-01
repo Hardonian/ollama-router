@@ -19,3 +19,6 @@ target/
 .vscode/
 .coverage
 htmlcov/
+
+# Cleanup additions
+.turbo

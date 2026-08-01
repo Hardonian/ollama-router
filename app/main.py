@@ -8,17 +8,19 @@ app = FastAPI(title="Ollama GPU Router")
 
 # Model size mapping (approximate VRAM in GB)
 MODEL_SIZES = {
+    "nomic-embed-text:latest": 0,
     "granite4.1:3b": 3,
-    "llama3.1:8b": 8,
-    "qwen2.5-coder:7b": 7,
-    "dolphin3:latest": 8,
-    "glm-4.7-flash:latest": 17,
+    "hermes3:latest": 5,
+    "llama3.1:8b": 5,
+    "qwen2.5-coder:7b": 5,
+    "dolphin3:latest": 5,
     "qwen3-vl:latest": 8,
-    "baytout3/Qwen3.6-27B-Uncensored-HauhauCS-Balanced:IQ4_XS": 27,
-    "qwen3:32b": 32,
-    "deepseek-r1:32b": 32,
-    "tinyrick/gemma-4-31B-it-uncensored-heretic-vision-llmfan46:Q4_K_M": 31,
-    "mistral-small3.2:latest": 24,
+    "glm-4.7-flash:latest": 19,
+    "baytout3/Qwen3.6-27B-Uncensored-HauhauCS-Balanced:IQ4_XS": 16,
+    "mistral-small3.2:latest": 15,
+    "qwen3:32b": 20,
+    "deepseek-r1:32b": 20,
+    "tinyrick/gemma-4-31B-it-uncensored-heretic-vision-llmfan46:Q4_K_M": 20,
 }
 
 # GPU lane mappings by VRAM capacity
@@ -40,13 +42,27 @@ def get_model_size(model_name: str) -> int:
 
 
 def route_model(model_name: str) -> int:
+    """Route to best GPU lane based on model VRAM fit.
+
+    Priority: smallest GPU that fits the model (save big GPUs for big models).
+    P40 (24GB) → 3060 (12GB) → V100 (16GB fallback).
+    Vision models always go to 3060 (compute 8.6).
+    Embedding models go to smallest available.
+    """
     vram_needed = get_model_size(model_name)
+    # Vision models need 3060 (best compute capability)
     if "vl" in model_name.lower() or "vision" in model_name.lower():
         return GPU_LANES["3060"]["port"]
-    if vram_needed >= 32:
-        return GPU_LANES["v100"]["port"]
+    # Embedding-only models: smallest GPU
+    if vram_needed <= 1:
+        return GPU_LANES["3060"]["port"]
+    # Large models (>=16GB): P40 has most VRAM
     if vram_needed >= 16:
         return GPU_LANES["p40"]["port"]
+    # Medium models (>=8GB): V100 or P40
+    if vram_needed >= 8:
+        return GPU_LANES["p40"]["port"]
+    # Small models (<8GB): 3060 (save bigger GPUs)
     return GPU_LANES["3060"]["port"]
 
 
@@ -78,7 +94,7 @@ async def proxy(request: Request, path: str):
     target_port = route_model(model_name) if model_name else GPU_LANES["3060"]["port"]
     target_url = f"http://127.0.0.1:{target_port}/{path}"
     
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10)) as client:
         try:
             if request.method == "GET":
                 resp = await client.get(target_url, params=request.query_params)
