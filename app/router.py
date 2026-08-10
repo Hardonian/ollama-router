@@ -33,6 +33,17 @@ class Router:
     def select(self, model: str) -> LaneState | None:
         now = time.time()
         healthy = [ls for ls in self.state.lanes.values() if ls.healthy and not self.state.is_circuit_open(ls, now)]
+        # Multiple listeners can share one physical GPU (the localhost compat
+        # lane shares GPU0 with v100).  The router must never treat those as
+        # independent VRAM pools; prefer the purpose-built lane and reserve
+        # compat only for direct legacy callers on :11434.
+        routed: dict[int | None, LaneState] = {}
+        for lane in healthy:
+            gpu = lane.physical_gpu
+            existing = routed.get(gpu)
+            if existing is None or (existing.cfg.role == "compat" and lane.cfg.role != "compat"):
+                routed[gpu] = lane
+        healthy = list(routed.values())
         if not healthy:
             return None
 

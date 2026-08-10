@@ -74,6 +74,26 @@ def test_router_smallest_fit():
     assert sel is not None and sel.cfg.name in ("p40",), sel.cfg.name
 
 
+def test_router_excludes_compat_lane_that_shares_v100_gpu():
+    cfg = RouterConfig(lanes=[])
+    cfg.lanes = [
+        _lane_cfg("v100", 11437, "0", "large"),
+        _lane_cfg("default", 11434, "0", "compat"),
+        _lane_cfg("p40", 11435, "1", "medium"),
+    ]
+    state = ClusterState.__new__(ClusterState)
+    state.lanes = {lane.cfg.name: lane for lane in cfg.lanes}
+    state.gpus = {0: GpuInfo(0, "V100", 16384, 0, 16384), 1: GpuInfo(1, "P40", 23040, 0, 23040)}
+    for lane in state.lanes.values():
+        lane.healthy = True
+        lane.gpu = state.gpus[lane.physical_gpu]
+    metrics = MetricsStore("/tmp/test-metrics-compat.json")
+    metrics.record("llama3.1:8b", "default", 1.0)
+    selected = Router(cfg, state, metrics).select("llama3.1:8b")
+    assert selected is not None
+    assert selected.cfg.name != "default"
+
+
 def test_metrics_learning():
     m = MetricsStore("/tmp/test-metrics3.json")
     m.record("llama3.1:8b", "3060", 120.0)
