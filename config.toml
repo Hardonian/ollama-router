@@ -1,0 +1,51 @@
+# ============================================================================
+# Ollama GPU Router — self-optimizing bifurcation + load-splitting framework
+# ----------------------------------------------------------------------------
+# Lane ports MUST match the live systemd lane bindings:
+#   ollama-v100.service   -> GPU0 (V100 16G)   -> :11437
+#   ollama-p40.service    -> GPU1 (P40  24G)   -> :11435
+#   ollama-3060.service   -> GPU2 (RTX3060 12G)-> :11436
+#   ollama-default.service-> GPU0 (V100 16G)   -> :11434  (localhost compat, shares GPU0)
+# cuda_visible_devices maps the lane to a PHYSICAL GPU index (1:1 on this host).
+# Lanes that share a cuda_visible_devices value share the same physical VRAM pool.
+# ============================================================================
+
+[router]
+host = "127.0.0.1"
+port = 11438
+poll_interval = 5.0            # seconds between cluster state refreshes
+request_timeout = 300.0       # read timeout for proxied requests (s) -- raised for cold 32B loads on P40
+connect_timeout = 10.0
+recovery_cooldown_sec = 600.0 # min seconds between auto-restarts of a dead lane
+recovery_max_attempts = 3     # max auto-restarts per lane before giving up
+circuit_breaker_threshold = 3 # consecutive failures before a lane is pulled
+circuit_breaker_cooldown_sec = 120.0
+vram_margin_gb = 0.5          # safety margin when judging "model fits"
+
+[[lanes]]
+name = "v100"
+port = 11437
+cuda_visible_devices = "0"
+systemd_unit = "ollama-v100.service"
+role = "large"                # big models (>=16G)
+
+[[lanes]]
+name = "p40"
+port = 11435
+cuda_visible_devices = "1"
+systemd_unit = "ollama-p40.service"
+role = "medium"               # mid models (8-24G)
+
+[[lanes]]
+name = "3060"
+port = 11436
+cuda_visible_devices = "2"
+systemd_unit = "ollama-3060.service"
+role = "vision"               # VL/vision + small models (best compute 8.6)
+
+[[lanes]]
+name = "default"
+port = 11434
+cuda_visible_devices = "0"
+systemd_unit = "ollama-default.service"
+role = "compat"              # localhost compatibility, shares GPU0 with v100

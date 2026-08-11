@@ -1,123 +1,197 @@
-import re
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-app = FastAPI(title="Ollama GPU Router")
+from app.config import RouterConfig
+from app.metrics import MetricsStore
+from app.router import Router
+from app.state import ClusterState
 
-# Model size mapping (approximate VRAM in GB)
-MODEL_SIZES = {
-    "nomic-embed-text:latest": 0,
-    "granite4.1:3b": 3,
-    "hermes3:latest": 5,
-    "llama3.1:8b": 5,
-    "qwen2.5-coder:7b": 5,
-    "dolphin3:latest": 5,
-    "qwen3-vl:latest": 8,
-    "glm-4.7-flash:latest": 19,
-    "baytout3/Qwen3.6-27B-Uncensored-HauhauCS-Balanced:IQ4_XS": 16,
-    "mistral-small3.2:latest": 15,
-    "qwen3:32b": 20,
-    "deepseek-r1:32b": 20,
-    "tinyrick/gemma-4-31B-it-uncensored-heretic-vision-llmfan46:Q4_K_M": 20,
-}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("ollama-router")
 
-# GPU lane mappings by VRAM capacity
-# Ports MUST match the live systemd lane bindings
-# (ollama-v100.service=>11437, ollama-p40.service=>11435, ollama-3060.service=>11436).
-# Router targets 127.0.0.1:<port>; lanes are localhost-only (no LAN exposure).
-GPU_LANES = {
-    "v100": {"port": 11437, "vram_gb": 16, "compute": "7.0"},
-    "p40": {"port": 11435, "vram_gb": 24, "compute": "6.1"},
-    "3060": {"port": 11436, "vram_gb": 12, "compute": "8.6"},
-}
+cfg = RouterConfig.load()
+state = ClusterState(cfg)
+metrics = MetricsStore()
+router = Router(cfg, state, metrics)
+
+# Background refresh loop.
+_stop = asyncio.Event()
 
 
-def get_model_size(model_name: str) -> int:
-    if model_name in MODEL_SIZES:
-        return MODEL_SIZES[model_name]
-    match = re.search(r"(\d+)b", model_name.lower())
-    return int(match.group(1)) if match else 8
+async def _refresh_loop() -> None:
+    while not _stop.is_set():
+        try:
+            await asyncio.to_thread(state.refresh)
+        except Exception as e:  # noqa: BLE001
+            log.warning("state refresh error: %s", e)
+        await asyncio.sleep(cfg.poll_interval)
 
 
-def route_model(model_name: str) -> int:
-    """Route to best GPU lane based on model VRAM fit.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    loop = asyncio.get_event_loop()
+    task = loop.create_task(_refresh_loop())
+    log.info("Ollama GPU Router started on :%d (%d lanes)", cfg.port, len(state.lanes))
+    try:
+        yield
+    finally:
+        _stop.set()
+        task.cancel()
 
-    Priority: smallest GPU that fits the model (save big GPUs for big models).
-    P40 (24GB) → 3060 (12GB) → V100 (16GB fallback).
-    Vision models always go to 3060 (compute 8.6).
-    Embedding models go to smallest available.
-    """
-    vram_needed = get_model_size(model_name)
-    # Vision models need 3060 (best compute capability)
-    if "vl" in model_name.lower() or "vision" in model_name.lower():
-        return GPU_LANES["3060"]["port"]
-    # Embedding-only models: smallest GPU
-    if vram_needed <= 1:
-        return GPU_LANES["3060"]["port"]
-    # Large models (>=16GB): P40 has most VRAM
-    if vram_needed >= 16:
-        return GPU_LANES["p40"]["port"]
-    # Medium models (>=8GB): V100 or P40
-    if vram_needed >= 8:
-        return GPU_LANES["p40"]["port"]
-    # Small models (<8GB): 3060 (save bigger GPUs)
-    return GPU_LANES["3060"]["port"]
+
+app = FastAPI(title="Ollama GPU Router — self-optimizing", lifespan=lifespan)
+
+
+async def _model_from_request(request: Request, path: str) -> str:
+    model = request.query_params.get("model") or ""
+    if not model and request.method == "POST":
+        try:
+            body = json.loads((await request.body()).decode() or "{}")
+            model = body.get("model", "")
+        except Exception:  # noqa: BLE001
+            model = ""
+    return model
 
 
 @app.get("/")
-async def root():
-    return PlainTextResponse("Ollama GPU Router running")
+async def root() -> PlainTextResponse:
+    return PlainTextResponse("Ollama GPU Router running (self-optimizing)")
+
+
+@app.get("/health")
+async def health() -> JSONResponse:
+    healthy = sum(1 for ls in state.lanes.values() if ls.healthy)
+    return JSONResponse({"status": "ok" if healthy else "degraded", "healthy_lanes": healthy, "total": len(state.lanes)})
 
 
 @app.get("/route-info")
-async def route_info(model: str):
-    return {
+async def route_info(model: str) -> JSONResponse:
+    ls = router.select(model)
+    if not ls:
+        raise HTTPException(status_code=503, detail="no healthy lane available")
+    return JSONResponse({
         "model": model,
-        "vram_needed_gb": get_model_size(model),
-        "target_port": route_model(model),
-        "target_gpu": [k for k, v in GPU_LANES.items() if v["port"] == route_model(model)][0]
-    }
+        "target_lane": ls.cfg.name,
+        "target_port": ls.cfg.port,
+        "physical_gpu": ls.physical_gpu,
+        "free_gib": ls.gpu.free_gib if ls.gpu else None,
+        "resident_here": model in ls.loaded,
+    })
+
+
+@app.get("/status")
+async def status() -> HTMLResponse:
+    snap = state.snapshot()
+    rows = ""
+    for name, ls in snap["lanes"].items():
+        free = ls["free_gib"]
+        rows += (
+            f"<tr><td><b>{name}</b></td><td>GPU {ls['physical_gpu']}</td><td>:{ls['port']}</td>"
+            f"<td style='color:{'green' if ls['healthy'] else 'red'}'>"
+            f"{'HEALTHY' if ls['healthy'] else 'DOWN'} {('('+ls['error'][:40]+')') if ls['error'] else ''}</td>"
+            f"<td>models:{ls['model_count']} resident:{ls['resident_gib']}GiB</td>"
+            f"<td>free:{free}GiB</td>"
+            f"<td style='color:{'orange' if ls['circuit_open'] else 'inherit'}'>"
+            f"{'CIRCUIT-OPEN' if ls['circuit_open'] else 'ok'}</td></tr>"
+        )
+    gpu_rows = "".join(
+        f"<tr><td>GPU {g['index']}</td><td colspan=5>{g['name']} — {g['free_mib']/1024:.1f}/{g['total_mib']/1024:.1f} GiB free</td></tr>"
+        for g in snap["gpus"].values()
+    )
+    html = f"""
+    <html><head><title>Ollama GPU Router — Status</title>
+    <style>body{{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:2em}}
+    table{{border-collapse:collapse;width:100%}} td,th{{border:1px solid #30363d;padding:6px 10px;text-align:left}}
+    h1{{color:#58a6ff}} .muted{{color:#8b949e}}</style></head>
+    <body><h1>Ollama GPU Router</h1>
+    <p class='muted'>last refresh: {time.strftime('%H:%M:%S', time.localtime(snap['last_refresh']))} ·
+    self-optimizing · failover + auto-recovery enabled</p>
+    <h3>Lanes</h3><table><tr><th>Lane</th><th>GPU</th><th>Port</th><th>State</th><th>Resident</th><th>Free</th><th>CB</th></tr>
+    {rows}</table>
+    <h3>Physical GPUs</h3><table><tr><th>GPU</th><th>Detail</th></tr>
+    {gpu_rows}</table></body></html>
+    """
+    return HTMLResponse(html)
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(request: Request, path: str):
-    model_name = request.query_params.get("model") or ""
-    if not model_name and request.method == "POST":
-        try:
-            body = await request.json()
-            model_name = body.get("model", "")
-        except ValueError:
-            pass
-    
-    target_port = route_model(model_name) if model_name else GPU_LANES["3060"]["port"]
-    target_url = f"http://127.0.0.1:{target_port}/{path}"
-    
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10)) as client:
-        try:
-            if request.method == "GET":
-                resp = await client.get(target_url, params=request.query_params)
-            else:
-                body = await request.body()
-                resp = await client.request(
-                    request.method,
-                    target_url,
-                    content=body,
-                    headers={k: v for k, v in request.headers.items() if k != "host"}
-                )
-            
-            try:
-                content = resp.json()
-            except ValueError:
-                content = resp.text
-            
-            return JSONResponse(
-                content=content,
-                status_code=resp.status_code,
-                headers={"X-GPU-Routed": str(target_port)}
+    model = await _model_from_request(request, path)
+    # Allow a client to pin a lane via header X-Lane (escape hatch / canary).
+    pinned = request.headers.get("x-lane")
+    if pinned and pinned in state.lanes:
+        ls = state.lanes[pinned]
+        if not ls.healthy or state.is_circuit_open(ls):
+            raise HTTPException(status_code=503, detail=f"pinned lane {pinned} unavailable")
+    else:
+        ls = router.select(model)
+    if not ls:
+        raise HTTPException(status_code=503, detail="no healthy lane available")
+
+    target_url = f"http://127.0.0.1:{ls.cfg.port}/{path}"
+    body = await request.body()
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length", "x-lane")}
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=cfg.connect_timeout, read=cfg.request_timeout, write=10, pool=10)) as client:
+            resp = await client.request(
+                request.method, target_url,
+                content=body, params=request.query_params, headers=headers,
             )
-        except httpx.ConnectError:
-            raise HTTPException(status_code=503, detail=f"GPU lane {target_port} unavailable")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        ms = (time.time() - t0) * 1000
+        if resp.status_code >= 500:
+            router.on_failure(ls, f"HTTP {resp.status_code}")
+            metrics.record(model, ls.cfg.name, ms, f"HTTP {resp.status_code}")
+            # failover: try one alternate lane for server errors
+            alt = router.select(model)
+            if alt and alt.cfg.name != ls.cfg.name:
+                return await _proxy_to(alt, request, path, model, body, headers)
+        else:
+            router.on_success(ls)
+            metrics.record(model, ls.cfg.name, ms)
+        try:
+            content = resp.json()
+        except Exception:
+            content = resp.text
+        return JSONResponse(content=content, status_code=resp.status_code, headers={"X-GPU-Routed-Lane": ls.cfg.name, "X-GPU-Routed": str(ls.cfg.port)})
+    except httpx.HTTPError as e:
+        ms = (time.time() - t0) * 1000
+        router.on_failure(ls, str(e))
+        metrics.record(model, ls.cfg.name, ms, str(e))
+        alt = router.select(model)
+        if alt and alt.cfg.name != ls.cfg.name:
+            return await _proxy_to(alt, request, path, model, body, headers)
+        raise HTTPException(status_code=503, detail=f"all lanes failed; last error: {e}")
+
+
+async def _proxy_to(ls, request, path, model, body, headers):
+    target_url = f"http://127.0.0.1:{ls.cfg.port}/{path}"
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=cfg.connect_timeout, read=cfg.request_timeout, write=10, pool=10)) as client:
+            resp = await client.request(request.method, target_url, content=body, params=request.query_params, headers=headers)
+        ms = (time.time() - t0) * 1000
+        if resp.status_code >= 500:
+            router.on_failure(ls, f"HTTP {resp.status_code}")
+            metrics.record(model, ls.cfg.name, ms, f"HTTP {resp.status_code}")
+        else:
+            router.on_success(ls)
+            metrics.record(model, ls.cfg.name, ms)
+        try:
+            content = resp.json()
+        except Exception:
+            content = resp.text
+        return JSONResponse(content=content, status_code=resp.status_code, headers={"X-GPU-Routed-Lane": ls.cfg.name, "X-GPU-Routed": str(ls.cfg.port), "X-GPU-Failover": "1"})
+    except httpx.HTTPError as e:
+        router.on_failure(ls, str(e))
+        metrics.record(model, ls.cfg.name, (time.time() - t0) * 1000, str(e))
+        raise HTTPException(status_code=503, detail=f"failover lane failed: {e}")
