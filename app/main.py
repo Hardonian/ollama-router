@@ -121,3 +121,5 @@ async def proxy(request: Request, path: str):
             raise HTTPException(status_code=503, detail=f"GPU lane {target_port} unavailable")
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+from health_metrics import router as health_metrics_router
+app.include_router(health_metrics_router)
