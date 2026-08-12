@@ -63,6 +63,15 @@ class Router:
             # Spilled, but nowhere better to go -- keep it where it is.
             return min(resident, key=lambda ls: self.metrics.best_lane_score(model, ls.cfg.name))
 
+        # 1.5) modality affinity: vision/VL models prefer the "vision" role lane
+        # (the 3060) when it can hold them. Vision workloads benefit from that
+        # GPU's compute and keep the big LLM lanes free for text. Only applied
+        # when the model is not already warm-resident elsewhere (step 1 handled
+        # that), so we never bounce an actively-serving model.
+        if self._is_vision(model):
+            vision_lanes = [ls for ls in healthy if ls.cfg.role == "vision" and self._fits(ls, vram)]
+            if vision_lanes:
+                return min(vision_lanes, key=lambda ls: ls.gpu.free_gib if ls.gpu else 0)
         # 2) learned best lane, if it fits there
         best = self.metrics.best_lane(model)
         if best and best in self.state.lanes:
@@ -92,6 +101,10 @@ class Router:
         #    layers on-die and runs fastest. Picking the smallest GPU here
         #    maximised CPU offload and made big MoE models crawl.
         return max(healthy, key=lambda ls: ls.gpu.total_gib if ls.gpu else 0)
+
+    def _is_vision(self, model: str) -> bool:
+        m = model.lower()
+        return any(tok in m for tok in ("vl", "vision", "llava", "minicpm-v", "qwen2.5-vl", "qwen3-vl", "qwen2-vl"))
 
     def _vram_for(self, model: str) -> float:
         # Best -> worst signal:

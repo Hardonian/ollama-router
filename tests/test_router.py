@@ -235,6 +235,37 @@ def test_idle_resident_model_vram_is_reclaimable():
     assert sel is not None and sel.cfg.name == "p40", sel.cfg.name if sel else None
 
 
+def test_vision_models_prefer_vision_lane():
+    """Vision/VL models should prefer the 'vision' role lane (the 3060) when it
+    fits, keeping the big LLM lanes free for text. Regression for modality
+    affinity routing."""
+    from app.config import LaneConfig
+
+    model = "qwen3-vl:latest"
+    cfg = RouterConfig(lanes=[])
+    cfg.lanes = [
+        _lane_cfg("v100", 11437, "0", "large"),
+        _lane_cfg("p40", 11435, "1", "medium"),
+        _lane_cfg("vision", 11436, "2", "vision"),
+    ]
+    state = ClusterState.__new__(ClusterState)
+    state.lanes = {lane.cfg.name: lane for lane in cfg.lanes}
+    state.gpus = {
+        0: GpuInfo(0, "V100", 16384, 2384, 14000),
+        1: GpuInfo(1, "P40", 23040, 3040, 20000),
+        2: GpuInfo(2, "3060", 12288, 2288, 10000),
+    }
+    for lane in state.lanes.values():
+        lane.healthy = True
+        lane.gpu = state.gpus[lane.physical_gpu]
+        lane.models = set()
+        lane.catalog = {model: 8_000_000_000}
+    router = Router(cfg, state, MetricsStore("/tmp/test-metrics-vision.json"))
+
+    sel = router.select(model)
+    assert sel is not None and sel.cfg.name == "vision", sel.cfg.name if sel else None
+
+
 from app.config import LaneConfig
 
 
