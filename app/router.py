@@ -50,8 +50,17 @@ class Router:
         vram = self._vram_for(model)
 
         # 1) warm affinity
+        # A resident model is normally the cheapest choice (no reload), but a
+        # badly-spilled one is not: a 30B MoE at 81% GPU measured 0.43 tok/s on
+        # the V100 versus 11.9 tok/s fully resident on the P40 (~28x). So only
+        # honour warm affinity when the model is mostly on the GPU, or when no
+        # other lane could hold it any better.
         resident = [ls for ls in healthy if model in ls.loaded]
-        if resident:
+        good_resident = [ls for ls in resident if self.state.gpu_fraction(ls, model) >= self.cfg.min_gpu_fraction]
+        if good_resident:
+            return min(good_resident, key=lambda ls: self.metrics.best_lane_score(model, ls.cfg.name))
+        if resident and not any(self._fits(ls, vram) for ls in healthy if ls not in resident):
+            # Spilled, but nowhere better to go -- keep it where it is.
             return min(resident, key=lambda ls: self.metrics.best_lane_score(model, ls.cfg.name))
 
         # 2) learned best lane, if it fits there
@@ -61,23 +70,57 @@ class Router:
             if ls in healthy and self._fits(ls, vram):
                 return ls
 
-        # 3) smallest GPU with enough free VRAM right now
+        # 3) smallest GPU that fits with enough FREE VRAM right now
         fitting = [ls for ls in healthy if self._fits(ls, vram)]
         if fitting:
             return min(fitting, key=lambda ls: ls.gpu.free_gib if ls.gpu else 0)
 
-        # 4) any healthy lane (overcommit — let Ollama decide; failover handles OOM)
-        return min(healthy, key=lambda ls: ls.gpu.free_gib if ls.gpu else 0)
+        # 3b) nothing fits now, but a lane can hold it once Ollama evicts its
+        #     idle resident models. Pick the smallest such lane (most GPU
+        #     headroom retained elsewhere). This is what keeps a 30B MoE off a
+        #     16G V100 (crawl) when a 23G P40 has an idle model squatting it.
+        fits_after_evict = [
+            ls for ls in healthy
+            if (ls.gpu.free_gib + self.state.reclaimable_gib(ls, model) - self.cfg.vram_margin_gb) >= vram
+        ]
+        if fits_after_evict:
+            return min(fits_after_evict, key=lambda ls: ls.gpu.free_gib if ls.gpu else 0)
+
+        # 4) Fits nowhere: this model will be partially offloaded to CPU no
+        #    matter what, so pick the lane with the MOST total VRAM. Ollama
+        #    offloads the remainder to RAM, so the biggest GPU keeps the most
+        #    layers on-die and runs fastest. Picking the smallest GPU here
+        #    maximised CPU offload and made big MoE models crawl.
+        return max(healthy, key=lambda ls: ls.gpu.total_gib if ls.gpu else 0)
 
     def _vram_for(self, model: str) -> float:
-        # If we already know the resident size from a lane, use it.
+        # Best -> worst signal:
+        #  1. resident size reported by /api/ps (ground truth, model is loaded)
+        #  2. on-disk size from /api/tags (real bytes; correct for MoE models
+        #     whose names imply far fewer weights than they actually ship)
+        #  3. name-based heuristic (last resort)
         for ls in self.state.lanes.values():
             if model in ls.loaded:
                 return estimate_vram_gib(model, ls.loaded[model])
+        for ls in self.state.lanes.values():
+            size = ls.catalog.get(model)
+            if size:
+                # Weights must fit alongside KV cache + runtime overhead.
+                return round(estimate_vram_gib(model, size) * 1.15, 2)
         return estimate_vram_gib(model)
 
     def _fits(self, ls: LaneState, vram_gib: float) -> bool:
-        return ls.fits(vram_gib, self.cfg.vram_margin_gb)
+        # A lane "fits" if either it has enough free VRAM now, OR it has enough
+        # once Ollama evicts idle resident models. Ollama proactively evicts
+        # least-recently-used models to load a new one, so a lane whose "free"
+        # VRAM looks too small only because an idle model is squatting it can
+        # still take the new model. Without this, a 30B MoE was wrongly sent to
+        # a smaller GPU while the biggest lane sat idle (measured 3x speed loss:
+        # 1.4 tok/s on V100 vs 4+ tok/s on P40).
+        if ls.fits(vram_gib, self.cfg.vram_margin_gb):
+            return True
+        free_plus_reclaim = ls.gpu.free_gib + self.state.reclaimable_gib(ls, "")
+        return (free_plus_reclaim - self.cfg.vram_margin_gb) >= vram_gib
 
     # -- failure / recovery ------------------------------------------------
     def on_failure(self, ls: LaneState, error: str) -> None:

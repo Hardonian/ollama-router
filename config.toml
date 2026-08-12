@@ -14,7 +14,7 @@
 host = "127.0.0.1"
 port = 11438
 poll_interval = 5.0            # seconds between cluster state refreshes
-request_timeout = 300.0       # read timeout for proxied requests (s) -- raised for cold 32B loads on P40
+request_timeout = 600.0       # read timeout for proxied requests (s) -- raised for cold 30B-A3B MoE loads that partially offload to CPU
 connect_timeout = 10.0
 recovery_cooldown_sec = 600.0 # min seconds between auto-restarts of a dead lane
 recovery_max_attempts = 3     # max auto-restarts per lane before giving up

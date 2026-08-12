@@ -39,6 +39,14 @@ class RouterConfig:
     circuit_breaker_threshold: int = 3
     circuit_breaker_cooldown_sec: float = 120.0
     vram_margin_gb: float = 0.5
+    # Minimum share of a resident model that must sit in VRAM before warm
+    # affinity is trusted. Below this the model is badly CPU-spilled and
+    # relocating to a bigger lane is far cheaper than reusing it in place.
+    min_gpu_fraction: float = 0.95
+    # Idle resident models whose eviction countdown (expires_at) is within
+    # this many seconds are treated as reclaimable VRAM when judging fit,
+    # because Ollama drops them on demand to load a new model.
+    idle_reclaim_grace_sec: float = 120.0
     hot_models: list[str] = field(default_factory=list)
     lanes: list[LaneConfig] = field(default_factory=list)
 
@@ -61,6 +69,8 @@ class RouterConfig:
             circuit_breaker_threshold=int(router.get("circuit_breaker_threshold", cls.circuit_breaker_threshold)),
             circuit_breaker_cooldown_sec=float(router.get("circuit_breaker_cooldown_sec", cls.circuit_breaker_cooldown_sec)),
             vram_margin_gb=float(router.get("vram_margin_gb", cls.vram_margin_gb)),
+            min_gpu_fraction=float(router.get("min_gpu_fraction", cls.min_gpu_fraction)),
+            idle_reclaim_grace_sec=float(router.get("idle_reclaim_grace_sec", cls.idle_reclaim_grace_sec)),
             hot_models=list(router.get("hot_models", [])),
             lanes=lanes or _default_lanes(),
         )

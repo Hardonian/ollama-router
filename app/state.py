@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import subprocess
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,6 +75,11 @@ class LaneState:
     last_error: str = ""
     models: set[str] = field(default_factory=set)
     loaded: dict[str, int] = field(default_factory=dict)  # model -> bytes resident
+    catalog: dict[str, int] = field(default_factory=dict)  # model -> on-disk bytes (from /api/tags)
+    loaded_vram: dict[str, int] = field(default_factory=dict)  # model -> bytes actually in VRAM
+    # model -> epoch seconds when Ollama will evict it (from /api/ps expires_at).
+    # 0.0 / missing = pinned ("never") and must NOT be reclaimed.
+    loaded_expires: dict[str, float] = field(default_factory=dict)
     gpu: GpuInfo | None = None
     failures: int = 0
     circuit_open_until: float = 0.0
@@ -128,9 +134,30 @@ class ClusterState:
             r.raise_for_status()
             data = r.json()
             ls.models = {m["name"] for m in data.get("models", [])}
+            # On-disk size per model is the single best VRAM predictor we have
+            # before a model is resident -- name-based guessing badly
+            # under-estimates MoE models (a "30b-a3b" is 25GB on disk, not 15).
+            ls.catalog = {m["name"]: int(m.get("size", 0)) for m in data.get("models", [])}
             ps = client.get(f"{base}/api/ps", timeout=8)
             ps.raise_for_status()
-            ls.loaded = {m["name"]: m.get("size", 0) for m in ps.json().get("models", [])}
+            running = ps.json().get("models", [])
+            ls.loaded = {m["name"]: m.get("size", 0) for m in running}
+            # size_vram < size means layers spilled to CPU; a heavily spilled
+            # model runs ~25x slower, so the router needs to see this.
+            ls.loaded_vram = {m["name"]: m.get("size_vram", 0) for m in running}
+            # expires_at is Ollama's own eviction countdown. A model whose timer
+            # is within the idle grace is unused and will be evicted the moment a
+            # bigger model needs the room -- so its VRAM is reclaimable when
+            # judging fit. "never" (keep_alive=-1) is pinned: not reclaimable.
+            ls.loaded_expires = {}
+            for m in running:
+                exp = m.get("expires_at")
+                if not exp or str(exp).lower() == "never":
+                    continue
+                try:
+                    ls.loaded_expires[m["name"]] = datetime.fromisoformat(str(exp)).timestamp()
+                except Exception:  # noqa: BLE001 -- unusual timestamp; treat as pinned
+                    ls.loaded_expires[m["name"]] = 0.0
             ls.healthy = True
             ls.last_error = ""
         except Exception as e:  # noqa: BLE001 — broad by design: any lane error = unhealthy
@@ -138,6 +165,30 @@ class ClusterState:
             ls.last_error = str(e)
             ls.models = set()
             ls.loaded = {}
+            ls.catalog = {}
+            ls.loaded_vram = {}
+            ls.loaded_expires = {}
+
+    def gpu_fraction(self, ls: LaneState, model: str) -> float:
+        """Fraction of a resident model's bytes that live in VRAM (1.0 = fully on GPU)."""
+        total = ls.loaded.get(model, 0)
+        if not total:
+            return 0.0
+        return ls.loaded_vram.get(model, 0) / total
+
+    def reclaimable_gib(self, ls: LaneState, model: str) -> float:
+        """VRAM (GiB) Ollama will evict to load `model`: any resident model
+        other than the target that is NOT pinned (expires_at != "never"). Ollama
+        proactively evicts idle/least-recently-used models to make room for a new
+        load, so their VRAM is available on demand. Pinned models (keep_alive=-1)
+        are the only ones that are not reclaimable."""
+        tot = 0.0
+        for name, vram in ls.loaded_vram.items():
+            if name == model:
+                continue
+            if ls.loaded_expires.get(name, 0.0) != 0.0:  # 0.0 == pinned/"never"
+                tot += vram / (1024**3)
+        return round(tot, 2)
 
     def is_circuit_open(self, ls: LaneState, now: float | None = None) -> bool:
         now = now or time.time()
