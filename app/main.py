@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from app.config import RouterConfig
 from app.metrics import MetricsStore
@@ -17,6 +18,10 @@ from app.state import ClusterState
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("ollama-router")
+
+# Thinking/reasoning models return empty content via Ollama OpenAI endpoint;
+# cap their uncapped output so OpenAI clients (Hermes) return in reasonable time.
+_THINKING_RE = re.compile(r"(nemotron|muse|deepseek-r1|qwq|reasoning|think)", re.IGNORECASE)
 
 cfg = RouterConfig.load()
 state = ClusterState(cfg)
@@ -144,27 +149,72 @@ async def chat_completions(request: Request):
     if not ls:
         raise HTTPException(status_code=503, detail="no healthy lane available")
 
-    # Streaming: delegate to Ollama's own OpenAI SSE (existing behavior).
+    # Streaming: call Ollama native /api/chat (NDJSON) and convert thinking
+    # deltas into OpenAI SSE content deltas so reasoning models stream.
+    # Default output cap for thinking models when client sends no max_tokens,
+    # so OpenAI clients (Hermes) don't wait 5-10 min for an uncapped reason.
+    _is_thinking = bool(_THINKING_RE.search(model))
+    if "max_tokens" not in body and "num_predict" not in body and _is_thinking:
+        _cap = 300
+    elif "num_predict" in body:
+        _cap = body["num_predict"]
+    elif "max_tokens" in body:
+        _cap = body["max_tokens"]
+    else:
+        _cap = None
     if stream:
-        target = f"http://127.0.0.1:{ls.cfg.port}/v1/chat/completions"
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length", "x-lane")}
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=cfg.connect_timeout, read=cfg.request_timeout, write=10, pool=10)) as client:
-                resp = await client.post(target, content=json.dumps(body).encode(), headers=headers)
-            router.on_success(ls)
-            return JSONResponse(content=resp.json(), status_code=resp.status_code,
-                                headers={"X-GPU-Routed-Lane": ls.cfg.name, "X-GPU-Routed": str(ls.cfg.port)})
-        except httpx.HTTPError as e:
-            router.on_failure(ls, str(e))
-            raise HTTPException(status_code=503, detail=f"lane failed: {e}")
+        native_stream_body = {
+            "model": model,
+            "messages": body.get("messages", []),
+            "stream": True,
+            "options": {k: body[k] for k in ("temperature", "top_p", "top_k", "seed") if k in body},
+        }
+        if _cap is not None:
+            native_stream_body["options"]["num_predict"] = _cap
+        if "think" in body:
+            native_stream_body["think"] = body["think"]
+        async def _gen():
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(connect=cfg.connect_timeout, read=cfg.request_timeout, write=10, pool=10)) as client:
+                    async with client.stream("POST", f"http://127.0.0.1:{ls.cfg.port}/api/chat",
+                                              json=native_stream_body, headers={"Content-Type": "application/json"}) as resp:
+                        router.on_success(ls)
+                        async for line in resp.aiter_lines():
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                chunk = json.loads(line)
+                            except Exception:
+                                continue
+                            msg = chunk.get("message", {})
+                            text = msg.get("thinking") or msg.get("content") or ""
+                            if not text and not chunk.get("done"):
+                                continue
+                            if chunk.get("done"):
+                                yield "data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}) + "\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+                            yield "data: " + json.dumps({"choices": [{"delta": {"content": text}, "index": 0}]}) + "\n\n"
+            except Exception as e:
+                import traceback as _tb
+                log.exception("streaming handler error: %s", e)
+                try:
+                    yield "data: " + json.dumps({"error": str(e)}) + "\n\n"
+                except Exception:
+                    pass
+        return StreamingResponse(_gen(), media_type="text/event-stream",
+                                 headers={"X-GPU-Routed-Lane": ls.cfg.name, "X-GPU-Routed": str(ls.cfg.port)})
 
     # Non-streaming: call native /api/chat, merge thinking into content.
     native_body = {
         "model": model,
         "messages": body.get("messages", []),
         "stream": False,
-        "options": {k: body[k] for k in ("temperature", "top_p", "top_k", "num_predict", "seed") if k in body},
+        "options": {k: body[k] for k in ("temperature", "top_p", "top_k", "seed") if k in body},
     }
+    if _cap is not None:
+        native_body["options"]["num_predict"] = _cap
     # Allow clients to disable thinking explicitly.
     if "think" in body:
         native_body["think"] = body["think"]
