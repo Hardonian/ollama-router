@@ -1,5 +1,9 @@
 # Ollama GPU Router
 
+<!-- BEGIN: REPO HERO -->
+![ollama-router — hero generated locally on the GPU stack](assets/repo-hero.png)
+<!-- END: REPO HERO -->
+
 > One endpoint for all your local models — routed to the right GPU, automatically.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue?logo=python)](https://www.python.org/)
